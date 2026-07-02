@@ -8,7 +8,8 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { createEventPipeline } from "./event-pipeline"
 import { isVSCodeRuntime } from "@/lib/desktop"
 import { isMobileSurfaceRuntime } from "@/lib/runtimeSurface"
-import { reduceGlobalEvent, applyGlobalProject, applyDirectoryEvent } from "./event-reducer"
+import { isCapacitorApp } from "@/lib/platform"
+import { reduceGlobalEvent, applyGlobalProject, applyDirectoryEvent, type SessionMaterializationReason } from "./event-reducer"
 import { useGlobalSyncStore } from "./global-sync-store"
 import { ChildStoreManager, type DirectoryStore } from "./child-store"
 import {
@@ -197,6 +198,13 @@ type PendingSessionMaterialization = {
   sessionID: string
   directory: string
   enqueuedAt: number
+  request: SessionMaterializationRequest
+}
+
+type SessionMaterializationRequest = {
+  reason: SessionMaterializationReason
+  messageID?: string
+  partID?: string
 }
 
 const SESSION_MATERIALIZATION_COOLDOWN_MS = 5_000
@@ -204,13 +212,18 @@ const pendingSessionMaterializations = new Map<string, PendingSessionMaterializa
 
 const materializationKey = (directory: string, sessionID: string) => `${directory}:${sessionID}`
 
-function enqueueSessionMaterialization(directory: string, sessionID: string, childStores: ChildStoreManager) {
+function enqueueSessionMaterialization(
+  directory: string,
+  sessionID: string,
+  childStores: ChildStoreManager,
+  request: SessionMaterializationRequest,
+) {
   if (!directory || directory === "global" || !sessionID) return
   const k = materializationKey(directory, sessionID)
   const existing = pendingSessionMaterializations.get(k)
   if (existing && Date.now() - existing.enqueuedAt < SESSION_MATERIALIZATION_COOLDOWN_MS) return
 
-  pendingSessionMaterializations.set(k, { sessionID, directory, enqueuedAt: Date.now() })
+  pendingSessionMaterializations.set(k, { sessionID, directory, enqueuedAt: Date.now(), request })
 
   // Defer to next microtask so we don't hold up the current event batch
   void Promise.resolve().then(async () => {
@@ -220,7 +233,7 @@ function enqueueSessionMaterialization(directory: string, sessionID: string, chi
       return
     }
     try {
-      await materializeSessionFromServer(directory, sessionID, store)
+      await materializeSessionFromServer(directory, sessionID, store, request)
     } catch {
       // Transient failure — next SSE event or reconnect will catch up.
     } finally {
@@ -233,8 +246,15 @@ async function materializeSessionFromServer(
   directory: string,
   sessionID: string,
   store: StoreApi<DirectoryStore>,
-  options?: { isStale?: () => boolean },
+  options?: SessionMaterializationRequest & { isStale?: () => boolean },
 ) {
+  syncDebug.recovery.materializing({
+    reason: options?.reason ?? "ensure-session-messages",
+    directory,
+    sessionID,
+    messageID: options?.messageID,
+    partID: options?.partID,
+  })
   const scopedClient = opencodeClient.getScopedSdkClient(directory)
   const result = await retry(async () => {
     const response = await scopedClient.session.messages({ sessionID, limit: SESSION_MATERIALIZATION_MESSAGE_LIMIT })
@@ -883,6 +903,11 @@ const childStoreHasMessagePartState = (
   return Object.prototype.hasOwnProperty.call(store.getState().part, messageID)
 }
 
+const getActiveDirectoryFallback = (childStores: ChildStoreManager): string | null => {
+  if (!_activeDirectory || !_activeSession) return null
+  return childStores.getChild(_activeDirectory) ? _activeDirectory : null
+}
+
 const resolveDirectoryFromRoutingIndex = (
   routingIndex: EventRoutingIndex,
   rawDirectory: string,
@@ -931,6 +956,15 @@ const resolveDirectoryFromRoutingIndex = (
         return dir
       }
     }
+
+    // Some reconnect/idle gaps can deliver part events before the matching
+    // message.updated event and without a sessionID. If the user is actively
+    // viewing a session, route the orphaned part event there so the reducer can
+    // trigger HTTP materialization instead of dropping it as a global event.
+    const activeDirectory = getActiveDirectoryFallback(childStores)
+    if (activeDirectory) {
+      return activeDirectory
+    }
   }
 
   // Single-store fallback: if there's only one directory, use it
@@ -946,6 +980,23 @@ const resolveDirectoryFromRoutingIndex = (
   }
 
   return normalizedDirectory
+}
+
+const resolveMaterializationSessionID = (
+  materializationSessionID: string | undefined,
+  messageID: string | undefined,
+  resolvedDirectory: string,
+  routingIndex: EventRoutingIndex,
+): string | undefined => {
+  if (materializationSessionID) return materializationSessionID
+  if (messageID) {
+    const indexedSessionID = routingIndex.messageSessionById.get(messageID)
+    if (indexedSessionID) return indexedSessionID
+  }
+  if (resolvedDirectory && resolvedDirectory === _activeDirectory && _activeSession) {
+    return _activeSession
+  }
+  return undefined
 }
 
 const updateRoutingIndexFromEvent = (
@@ -1188,6 +1239,7 @@ async function resyncDirectoryAfterReconnect(
   directory: string,
   store: StoreApi<DirectoryStore>,
   routingIndex: EventRoutingIndex,
+  reason: SessionMaterializationReason,
 ) {
   const current = store.getState()
   const candidateSessionIds = getActiveSessionCandidateIds(directory, current)
@@ -1197,6 +1249,7 @@ async function resyncDirectoryAfterReconnect(
 
   const scopedClient = opencodeClient.getScopedSdkClient(directory)
   await Promise.all(candidateSessionIds.map(async (sessionId) => {
+    syncDebug.recovery.materializing({ reason, directory, sessionID: sessionId })
     const [sessionResponse, messageResponse] = await Promise.all([
       retry(async () => {
         const response = await scopedClient.session.get({ sessionID: sessionId })
@@ -1466,7 +1519,7 @@ function handleEvent(
         ? (idleSession as Session & { parentID?: string | null }).parentID
         : null
       if (parentID) {
-        enqueueSessionMaterialization(resolvedDirectory, parentID, childStores)
+        enqueueSessionMaterialization(resolvedDirectory, parentID, childStores, { reason: "child-session-idle" })
       }
     }
   }
@@ -1548,7 +1601,10 @@ function handleEvent(
       const after = store.getState()
       const info = (payload.properties as { info: Message }).info
       if (info.role === "assistant" && (!after.part[messageID] || after.part[messageID].length === 0)) {
-        enqueueSessionMaterialization(resolvedDirectory, sessionID, childStores)
+        enqueueSessionMaterialization(resolvedDirectory, sessionID, childStores, {
+          reason: "empty-assistant-message",
+          messageID,
+        })
       }
     }
   } else {
@@ -1561,9 +1617,18 @@ function handleEvent(
   // Snapshot materialization is driven by typed reducer outcomes, not by
   // inferring meaning from a generic false/no-change result.
   if (materializationResult) {
-    const materializationSessionID = materializationResult.sessionID ?? getSessionIdFromPayload(payload) ?? undefined
+    const materializationSessionID = resolveMaterializationSessionID(
+      materializationResult.sessionID ?? getSessionIdFromPayload(payload) ?? undefined,
+      materializationResult.messageID ?? getMessageIdFromPayload(payload) ?? undefined,
+      resolvedDirectory,
+      routingIndex,
+    )
     if (materializationSessionID) {
-      enqueueSessionMaterialization(resolvedDirectory, materializationSessionID, childStores)
+      enqueueSessionMaterialization(resolvedDirectory, materializationSessionID, childStores, {
+        reason: materializationResult.reason,
+        messageID: materializationResult.messageID,
+        partID: materializationResult.partID,
+      })
     }
   }
 
@@ -1584,7 +1649,12 @@ export function SyncProvider(props: {
   directory: string
   children: React.ReactNode
 }) {
-  const messageStreamTransport = useConfigStore((state) => state.settingsMessageStreamTransport)
+  const storedMessageStreamTransport = useConfigStore((state) => state.settingsMessageStreamTransport)
+  // Capacitor apps are locked to SSE: native WebSocket streaming is unreliable there (on
+  // Android events only arrive once the run finishes), while SSE streams correctly. The Chat
+  // settings UI disables the other options on mobile, but force it here too so the effective
+  // transport can't drift. Remove this override (and the UI lock) to re-enable WS on mobile.
+  const messageStreamTransport: 'auto' | 'ws' | 'sse' = isCapacitorApp() ? 'sse' : storedMessageStreamTransport
   const childStoresRef = useRef<ChildStoreManager | null>(null)
   if (!childStoresRef.current) childStoresRef.current = new ChildStoreManager()
   const childStores = childStoresRef.current
@@ -1608,7 +1678,7 @@ export function SyncProvider(props: {
     [childStores, props.sdk, props.directory],
   )
 
-  const triggerDirectoryResync = useCallback((directory: string) => {
+  const triggerDirectoryResync = useCallback((directory: string, reason: SessionMaterializationReason) => {
     const store = childStores.children.get(directory)
     if (!store) return
     const resyncing = resyncingDirectoriesRef.current
@@ -1616,7 +1686,7 @@ export function SyncProvider(props: {
 
     lastFullResyncAtByDirectoryRef.current.set(directory, Date.now())
     resyncing.add(directory)
-    void resyncDirectoryAfterReconnect(directory, store, routingIndex)
+    void resyncDirectoryAfterReconnect(directory, store, routingIndex, reason)
       .catch(() => {
         // Transient failure — the watchdog, next SSE event, or reconnect will catch up.
       })
@@ -1803,7 +1873,7 @@ export function SyncProvider(props: {
           return
         }
         for (const dir of childStores.children.keys()) {
-          triggerDirectoryResync(dir)
+          triggerDirectoryResync(dir, "stream-reconnect")
         }
       },
       onDisconnect: (reason) => {
@@ -1823,7 +1893,7 @@ export function SyncProvider(props: {
           connectionPhase: "connected",
         })
         for (const dir of childStores.children.keys()) {
-          triggerDirectoryResync(dir)
+          triggerDirectoryResync(dir, "transport-switch")
         }
       },
     })
@@ -1880,7 +1950,7 @@ export function SyncProvider(props: {
         // Trigger parent session materialization so the task tool part
         // state (metadata, sessionId, output) is refreshed.
         for (const pid of parentIdsForMaterialization) {
-          enqueueSessionMaterialization(directory, pid, childStores)
+          enqueueSessionMaterialization(directory, pid, childStores, { reason: "child-session-discovered" })
         }
       } catch {
         // Best-effort — next tick will retry.
@@ -1903,7 +1973,7 @@ export function SyncProvider(props: {
           needsSnapshotAfterStatusPoll(before, sessionId, statuses[sessionId])
         ))
         if (needsSnapshot) {
-          triggerDirectoryResync(directory)
+          triggerDirectoryResync(directory, "stale-status-resync")
         }
       } finally {
         polling.delete(directory)
@@ -1935,7 +2005,7 @@ export function SyncProvider(props: {
             const lastFullResyncAt = lastFullResyncAtByDirectoryRef.current.get(directory) ?? 0
             if (shouldTriggerStaleResync(lastStreamActivityAtRef.current, lastFullResyncAt, now)) {
               pipelineReconnectRef.current?.("active_stream_stale")
-              triggerDirectoryResync(directory)
+              triggerDirectoryResync(directory, "stale-status-resync")
             }
 
             // Discover child sessions created by other OpenCode instances
@@ -2634,7 +2704,7 @@ export function useEnsureSessionMessages(sessionID: string, directory?: string) 
 
     void (async () => {
       try {
-        await materializeSessionFromServer(resolvedDirectory, sessionID, store, { isStale })
+        await materializeSessionFromServer(resolvedDirectory, sessionID, store, { reason: "ensure-session-messages", isStale })
       } catch {
         // Transient failure — next navigation or reconnect will retry
       } finally {
